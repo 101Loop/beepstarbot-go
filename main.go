@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/getsentry/sentry-go"
 	"github.com/joho/godotenv"
 	"io"
 	"log"
@@ -13,14 +14,13 @@ import (
 	"time"
 )
 
-// Telegram Constants
 const (
 	// APIEndpoint is the endpoint for all API methods,
 	// with formatting for Sprintf.
 	APIEndpoint = "https://api.telegram.org/bot%s/%s"
 )
 
-// APIResponse is a response from the Telegram API with the result
+// APIResponse is response from the Telegram API with the result
 // stored raw.
 type APIResponse struct {
 	Ok          bool                `json:"ok"`
@@ -47,7 +47,7 @@ func (e Error) Error() string {
 	return e.Message
 }
 
-// webhookReqBody struct that mimics the webhook response body
+// webhookReqBody struct that mimics the webhook response body from telegram
 // https://core.telegram.org/bots/api#update
 type webhookReqBody struct {
 	Message struct {
@@ -56,7 +56,8 @@ type webhookReqBody struct {
 			ID int64 `json:"id"`
 		} `json:"chat"`
 		From struct {
-			ID int64 `json:"id"`
+			ID        int64  `json:"id"`
+			FirstName string `json:"first_name"`
 		} `json:"from"`
 	} `json:"message"`
 }
@@ -74,6 +75,7 @@ func Handler(res http.ResponseWriter, req *http.Request) {
 	// Decode the JSON response body
 	body := &webhookReqBody{}
 	if err := json.NewDecoder(req.Body).Decode(body); err != nil {
+		sentry.CaptureException(err)
 		fmt.Println("Could not decode request body", err)
 		return
 	}
@@ -84,39 +86,79 @@ func Handler(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// if the text contains `aww`, call kickUser function
-	if _, err := kickUser(body.Message.Chat.ID, body.Message.From.ID); err != nil {
-		fmt.Println("Error occurred", err)
-		return
-	}
+	// if text contains `aww`, call kickUser function
+	if _, err := kickChatMember(body.Message.Chat.ID, body.Message.From.ID); err != nil {
+		// handle when message sent by owner of group
+		if fmt.Sprint(err) == "Bad Request: can't remove chat owner" {
+			if _, err := sendMessage(body.Message.Chat.ID, "Group Owner's can use forbidden words!"); err != nil {
+				sentry.CaptureException(err)
+				return
+			}
+		// handle when bot doesn't have enough permission to kick users
+		} else if fmt.Sprint(err) == "Bad Request: not enough rights to restrict/unrestrict chat member" {
+			text := "Forbidden Word used but I don't have enough permissions to kick members. Please make me an admin."
+			if _, err := sendMessage(body.Message.Chat.ID, text); err != nil {
+				sentry.CaptureException(err)
+				return
+			}
+		// handle when message sent by group admin
+		} else if fmt.Sprint(err) == "Bad Request: user is an administrator of the chat" {
+			text := "Chat Admins can also use forbidden words!"
+			if _, err := sendMessage(body.Message.Chat.ID, text); err != nil {
+				sentry.CaptureException(err)
+				return
+			}
+		// handle when message sent in private chat
+		} else if fmt.Sprint(err) == "Bad Request: chat member status can't be changed in private chats" {
+			text := "Sorry, This doesn't work in private chats!"
+			if _, err := sendMessage(body.Message.Chat.ID, text); err != nil {
+				sentry.CaptureException(err)
+				return
+			}
+		// for any other errors, log errors to sentry
+		} else {
+			sentry.CaptureException(err)
+			return
+		}
+	// then call sendMessage to send message in group
+	} else {
+		firstName := body.Message.From.FirstName
+		text := fmt.Sprintf("%s have used a forbidden word and will be banned for a day from this group.", firstName)
 
-	// log confirmation message
-	fmt.Println("User Kicked!")
+		_, err := sendMessage(body.Message.Chat.ID, text)
+		if err != nil {
+			sentry.CaptureException(err)
+			return
+		}
+	}
 }
 
 // Below code deals with kicking user & sending message to the group
 
-// kickUserReqBody struct to confirm the JSON body
-// of the send request
-// https://core.telegram.org/bots/api#sendmessage
-type kickUserReqBody struct {
+// kickChatMemberReqBody struct to confirm the JSON body
+// of the request
+// https://core.telegram.org/bots/api#kickchatmember
+type kickChatMemberReqBody struct {
 	ChatID    int64 `json:"chat_id"`
 	UserID    int64 `json:"user_id"`
 	UntilDate int64 `json:"until_date"`
 }
 
-// kickUser takes a chatID and sends message to them
-func kickUser(chatID int64, userID int64) (APIResponse, error) {
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("Error loading .env file")
-	}
+// sendMessageReqBody struct to confirm the JSON body
+// of the request
+// https://core.telegram.org/bots/api#sendmessage
+type sendMessageReqBody struct {
+	ChatID int64  `json:"chat_id"`
+	Text   string `json:"text"`
+}
 
+// kickChatMember takes chatID and userID to kick members from group
+func kickChatMember(chatID int64, userID int64) (APIResponse, error) {
 	t := time.Now()
 	untilDate := t.AddDate(0, 0, 1).Unix()
 
 	// Create request body struct
-	reqBody := &kickUserReqBody{
+	reqBody := &kickChatMemberReqBody{
 		ChatID:    chatID,
 		UserID:    userID,
 		UntilDate: untilDate,
@@ -130,6 +172,30 @@ func kickUser(chatID int64, userID int64) (APIResponse, error) {
 
 	endpoint := fmt.Sprintf(APIEndpoint, os.Getenv("BOT_TOKEN"), "kickChatMember")
 
+	return handleAPIResponse(err, endpoint, reqJSON)
+}
+
+// sendMessage sends message to the telegram group when user is kicked
+func sendMessage(chatID int64, text string) (APIResponse, error) {
+	// Create request body struct
+	reqBody := &sendMessageReqBody{
+		ChatID: chatID,
+		Text:   text,
+	}
+
+	// Create JSON body from the struct
+	reqJSON, err := json.Marshal(reqBody)
+	if err != nil {
+		return APIResponse{}, err
+	}
+
+	endpoint := fmt.Sprintf(APIEndpoint, os.Getenv("BOT_TOKEN"), "sendMessage")
+
+	return handleAPIResponse(err, endpoint, reqJSON)
+}
+
+// handleAPIResponse handles API call to telegram
+func handleAPIResponse(err error, endpoint string, reqJSON []byte) (APIResponse, error) {
 	// Send Post Request to Telegram API
 	res, err := http.Post(endpoint, "application/json", bytes.NewBuffer(reqJSON))
 	if err != nil {
@@ -155,6 +221,22 @@ func kickUser(chatID int64, userID int64) (APIResponse, error) {
 }
 
 func main() {
+	err := godotenv.Load()
+	if err != nil {
+		sentry.CaptureException(err)
+	}
+
+	err = sentry.Init(sentry.ClientOptions{
+		Dsn: os.Getenv("SENTRY_DSN"),
+	})
+
+	if err != nil {
+		log.Fatalf("sentry.Init: %s", err)
+	}
+	// Flush buffered events before the program terminates.
+	// Set the timeout to the maximum duration the program can afford to wait.
+	defer sentry.Flush(2 * time.Second)
+
 	server := &http.Server{
 		Addr:    ":3000",
 		Handler: http.HandlerFunc(Handler),
